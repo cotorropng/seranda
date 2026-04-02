@@ -1,5 +1,5 @@
 const express = require('express');
-const Database = require('better-sqlite3');
+const { Pool } = require('pg');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const path = require('path');
@@ -59,7 +59,6 @@ if (!fs.existsSync(publicDir) && fs.existsSync(zipPath)) {
     extractZip(zipPath, publicDir);
 }
 
-// Aplicar fix de localhost en archivos JS/HTML si es necesario
 const filesToFix = [
     path.join(publicDir, 'login.html'),
     path.join(publicDir, 'admin.js'),
@@ -77,16 +76,44 @@ for (const f of filesToFix) {
     }
 }
 
-// ── Base de datos ──────────────────────────────────────────────────────────
-const db = new Database(path.join(__dirname, 'juegos.db'));
-db.exec(`
-CREATE TABLE IF NOT EXISTS instituciones (id INTEGER PRIMARY KEY AUTOINCREMENT, nombre TEXT, codigo TEXT UNIQUE);
-CREATE TABLE IF NOT EXISTS usuarios (id INTEGER PRIMARY KEY AUTOINCREMENT, nombre TEXT, usuario TEXT UNIQUE, password TEXT, rol TEXT, institucion_id INTEGER);
-CREATE TABLE IF NOT EXISTS progreso (id INTEGER PRIMARY KEY AUTOINCREMENT, usuario_id INTEGER, juego TEXT, puntaje INTEGER, fecha TEXT DEFAULT (date('now')));
-`);
-if (!db.prepare("SELECT * FROM usuarios WHERE rol = 'admin'").get()) {
-    db.prepare("INSERT INTO usuarios (nombre, usuario, password, rol) VALUES (?, ?, ?, ?)").run('Admin', 'admin', bcrypt.hashSync('admin1234', 10), 'admin');
-    console.log('Admin creado');
+// ── Base de datos PostgreSQL ───────────────────────────────────────────────
+const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+
+async function query(text, params) {
+    const client = await pool.connect();
+    try { return await client.query(text, params); }
+    finally { client.release(); }
+}
+
+async function initDB() {
+    await query(`
+        CREATE TABLE IF NOT EXISTS instituciones (
+            id SERIAL PRIMARY KEY,
+            nombre TEXT,
+            codigo TEXT UNIQUE
+        );
+        CREATE TABLE IF NOT EXISTS usuarios (
+            id SERIAL PRIMARY KEY,
+            nombre TEXT,
+            usuario TEXT UNIQUE,
+            password TEXT,
+            rol TEXT,
+            institucion_id INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS progreso (
+            id SERIAL PRIMARY KEY,
+            usuario_id INTEGER,
+            juego TEXT,
+            puntaje INTEGER,
+            fecha DATE DEFAULT CURRENT_DATE
+        );
+    `);
+    const { rows } = await query("SELECT * FROM usuarios WHERE rol = 'admin' LIMIT 1");
+    if (rows.length === 0) {
+        const hash = await bcrypt.hash('admin1234', 10);
+        await query("INSERT INTO usuarios (nombre, usuario, password, rol) VALUES ($1,$2,$3,$4)", ['Admin', 'admin', hash, 'admin']);
+        console.log('Admin creado');
+    }
 }
 
 // ── Middleware ─────────────────────────────────────────────────────────────
@@ -105,49 +132,100 @@ function auth(req, res, next) {
 // ── Rutas ──────────────────────────────────────────────────────────────────
 app.get('/', (req, res) => res.redirect('/login.html'));
 
-app.post('/login', (req, res) => {
-    const user = db.prepare("SELECT * FROM usuarios WHERE usuario = ?").get(req.body.usuario);
-    if (!user || !bcrypt.compareSync(req.body.password, user.password)) return res.status(401).json({ error: 'Credenciales incorrectas' });
-    const token = jwt.sign({ id: user.id, nombre: user.nombre, rol: user.rol, institucion_id: user.institucion_id }, SECRET, { expiresIn: '8h' });
-    res.json({ token, rol: user.rol, nombre: user.nombre });
+app.post('/login', async (req, res) => {
+    try {
+        const { rows } = await query("SELECT * FROM usuarios WHERE usuario = $1", [req.body.usuario]);
+        const user = rows[0];
+        if (!user || !await bcrypt.compare(req.body.password, user.password)) return res.status(401).json({ error: 'Credenciales incorrectas' });
+        const token = jwt.sign({ id: user.id, nombre: user.nombre, rol: user.rol, institucion_id: user.institucion_id }, SECRET, { expiresIn: '8h' });
+        res.json({ token, rol: user.rol, nombre: user.nombre });
+    } catch (e) { res.status(500).json({ error: 'Error del servidor' }); }
 });
 
-app.post('/registro', (req, res) => {
-    const { nombre, usuario, password, codigo } = req.body;
-    let institucion_id = null;
-    if (codigo) {
-        const inst = db.prepare("SELECT id FROM instituciones WHERE codigo = ?").get(codigo);
-        if (!inst) return res.status(400).json({ error: 'Código de institución no válido' });
-        institucion_id = inst.id;
-    }
-    try { db.prepare("INSERT INTO usuarios (nombre, usuario, password, rol, institucion_id) VALUES (?, ?, ?, 'estudiante', ?)").run(nombre, usuario, bcrypt.hashSync(password, 10), institucion_id); res.json({ ok: true }); }
+app.post('/registro', async (req, res) => {
+    try {
+        const { nombre, usuario, password, codigo } = req.body;
+        let institucion_id = null;
+        if (codigo) {
+            const { rows } = await query("SELECT id FROM instituciones WHERE codigo = $1", [codigo]);
+            if (!rows[0]) return res.status(400).json({ error: 'Código de institución no válido' });
+            institucion_id = rows[0].id;
+        }
+        await query("INSERT INTO usuarios (nombre, usuario, password, rol, institucion_id) VALUES ($1,$2,$3,'estudiante',$4)", [nombre, usuario, await bcrypt.hash(password, 10), institucion_id]);
+        res.json({ ok: true });
+    } catch { res.status(400).json({ error: 'Usuario ya existe' }); }
+});
+
+app.post('/progreso', auth, async (req, res) => {
+    await query("INSERT INTO progreso (usuario_id, juego, puntaje) VALUES ($1,$2,$3)", [req.usuario.id, req.body.juego, req.body.puntaje]);
+    res.json({ ok: true });
+});
+
+app.get('/progreso', auth, async (req, res) => {
+    const { rows } = await query("SELECT juego, MAX(puntaje) as puntaje FROM progreso WHERE usuario_id = $1 GROUP BY juego", [req.usuario.id]);
+    res.json(rows);
+});
+
+app.get('/stats', auth, async (req, res) => {
+    const [e, i, j] = await Promise.all([
+        query("SELECT COUNT(*) as total FROM usuarios WHERE rol = 'estudiante'"),
+        query("SELECT COUNT(*) as total FROM instituciones"),
+        query("SELECT juego, COUNT(*) as veces FROM progreso GROUP BY juego ORDER BY veces DESC")
+    ]);
+    res.json({ totalEstudiantes: e.rows[0], totalInstituciones: i.rows[0], jugadas: j.rows });
+});
+
+app.get('/instituciones', auth, async (req, res) => { const { rows } = await query("SELECT * FROM instituciones"); res.json(rows); });
+app.post('/instituciones', auth, async (req, res) => {
+    try { await query("INSERT INTO instituciones (nombre, codigo) VALUES ($1,$2)", [req.body.nombre, req.body.codigo]); res.json({ ok: true }); }
+    catch { res.status(400).json({ error: 'Código ya existe' }); }
+});
+app.delete('/instituciones/:id', auth, async (req, res) => {
+    await query("DELETE FROM usuarios WHERE institucion_id = $1", [req.params.id]);
+    await query("DELETE FROM instituciones WHERE id = $1", [req.params.id]);
+    res.json({ ok: true });
+});
+
+app.get('/coordinadores', auth, async (req, res) => { const { rows } = await query("SELECT u.id, u.nombre, u.usuario, i.nombre as institucion, i.codigo FROM usuarios u LEFT JOIN instituciones i ON u.institucion_id = i.id WHERE u.rol = 'coordinador'"); res.json(rows); });
+app.post('/usuarios/coordinador', auth, async (req, res) => {
+    try { await query("INSERT INTO usuarios (nombre, usuario, password, rol, institucion_id) VALUES ($1,$2,$3,'coordinador',$4)", [req.body.nombre, req.body.usuario, await bcrypt.hash(req.body.password, 10), req.body.institucion_id]); res.json({ ok: true }); }
     catch { res.status(400).json({ error: 'Usuario ya existe' }); }
 });
+app.delete('/usuarios/coordinador/:id', auth, async (req, res) => { await query("DELETE FROM usuarios WHERE id = $1 AND rol = 'coordinador'", [req.params.id]); res.json({ ok: true }); });
 
-app.post('/progreso', auth, (req, res) => { db.prepare("INSERT INTO progreso (usuario_id, juego, puntaje) VALUES (?, ?, ?)").run(req.usuario.id, req.body.juego, req.body.puntaje); res.json({ ok: true }); });
-app.get('/progreso', auth, (req, res) => res.json(db.prepare("SELECT juego, MAX(puntaje) as puntaje FROM progreso WHERE usuario_id = ? GROUP BY juego").all(req.usuario.id)));
-app.get('/stats', auth, (req, res) => res.json({ totalEstudiantes: db.prepare("SELECT COUNT(*) as total FROM usuarios WHERE rol = 'estudiante'").get(), totalInstituciones: db.prepare("SELECT COUNT(*) as total FROM instituciones").get(), jugadas: db.prepare("SELECT juego, COUNT(*) as veces FROM progreso GROUP BY juego ORDER BY veces DESC").all() }));
+app.get('/profes', auth, async (req, res) => { const { rows } = await query("SELECT u.id, u.nombre, u.usuario, i.nombre as institucion, i.codigo FROM usuarios u LEFT JOIN instituciones i ON u.institucion_id = i.id WHERE u.rol = 'profe'"); res.json(rows); });
+app.get('/estudiantes', auth, async (req, res) => { const { rows } = await query("SELECT u.id, u.nombre, u.usuario, i.nombre as institucion, i.codigo FROM usuarios u LEFT JOIN instituciones i ON u.institucion_id = i.id WHERE u.rol = 'estudiante'"); res.json(rows); });
 
-app.get('/instituciones', auth, (req, res) => res.json(db.prepare("SELECT * FROM instituciones").all()));
-app.post('/instituciones', auth, (req, res) => { try { db.prepare("INSERT INTO instituciones (nombre, codigo) VALUES (?, ?)").run(req.body.nombre, req.body.codigo); res.json({ ok: true }); } catch { res.status(400).json({ error: 'Código ya existe' }); } });
-app.delete('/instituciones/:id', auth, (req, res) => { db.prepare("DELETE FROM usuarios WHERE institucion_id = ?").run(req.params.id); db.prepare("DELETE FROM instituciones WHERE id = ?").run(req.params.id); res.json({ ok: true }); });
+app.get('/coordinador/stats', auth, async (req, res) => {
+    const id = req.usuario.institucion_id;
+    const [p, e, j] = await Promise.all([
+        query("SELECT COUNT(*) as total FROM usuarios WHERE rol = 'profe' AND institucion_id = $1", [id]),
+        query("SELECT COUNT(*) as total FROM usuarios WHERE rol = 'estudiante' AND institucion_id = $1", [id]),
+        query("SELECT p.juego, COUNT(*) as veces FROM progreso p JOIN usuarios u ON p.usuario_id = u.id WHERE u.institucion_id = $1 GROUP BY p.juego ORDER BY veces DESC", [id])
+    ]);
+    res.json({ totalProfes: p.rows[0], totalEstudiantes: e.rows[0], jugadas: j.rows });
+});
 
-app.get('/coordinadores', auth, (req, res) => res.json(db.prepare("SELECT u.id, u.nombre, u.usuario, i.nombre as institucion, i.codigo FROM usuarios u LEFT JOIN instituciones i ON u.institucion_id = i.id WHERE u.rol = 'coordinador'").all()));
-app.post('/usuarios/coordinador', auth, (req, res) => { try { db.prepare("INSERT INTO usuarios (nombre, usuario, password, rol, institucion_id) VALUES (?, ?, ?, 'coordinador', ?)").run(req.body.nombre, req.body.usuario, bcrypt.hashSync(req.body.password, 10), req.body.institucion_id); res.json({ ok: true }); } catch { res.status(400).json({ error: 'Usuario ya existe' }); } });
-app.delete('/usuarios/coordinador/:id', auth, (req, res) => { db.prepare("DELETE FROM usuarios WHERE id = ? AND rol = 'coordinador'").run(req.params.id); res.json({ ok: true }); });
+app.get('/coordinador/profes', auth, async (req, res) => { const { rows } = await query("SELECT id, nombre, usuario FROM usuarios WHERE rol = 'profe' AND institucion_id = $1", [req.usuario.institucion_id]); res.json(rows); });
+app.post('/coordinador/profes', auth, async (req, res) => {
+    try { await query("INSERT INTO usuarios (nombre, usuario, password, rol, institucion_id) VALUES ($1,$2,$3,'profe',$4)", [req.body.nombre, req.body.usuario, await bcrypt.hash(req.body.password, 10), req.usuario.institucion_id]); res.json({ ok: true }); }
+    catch { res.status(400).json({ error: 'Usuario ya existe' }); }
+});
+app.delete('/coordinador/profes/:id', auth, async (req, res) => { await query("DELETE FROM usuarios WHERE id = $1 AND rol = 'profe' AND institucion_id = $2", [req.params.id, req.usuario.institucion_id]); res.json({ ok: true }); });
 
-app.get('/profes', auth, (req, res) => res.json(db.prepare("SELECT u.id, u.nombre, u.usuario, i.nombre as institucion, i.codigo FROM usuarios u LEFT JOIN instituciones i ON u.institucion_id = i.id WHERE u.rol = 'profe'").all()));
-app.get('/estudiantes', auth, (req, res) => res.json(db.prepare("SELECT u.id, u.nombre, u.usuario, i.nombre as institucion, i.codigo FROM usuarios u LEFT JOIN instituciones i ON u.institucion_id = i.id WHERE u.rol = 'estudiante'").all()));
+app.get('/profesor/estudiantes', auth, async (req, res) => { const { rows } = await query("SELECT id, nombre, usuario FROM usuarios WHERE rol = 'estudiante' AND institucion_id = $1", [req.usuario.institucion_id]); res.json(rows); });
+app.post('/profesor/estudiantes', auth, async (req, res) => {
+    try { await query("INSERT INTO usuarios (nombre, usuario, password, rol, institucion_id) VALUES ($1,$2,$3,'estudiante',$4)", [req.body.nombre, req.body.usuario, await bcrypt.hash(req.body.password, 10), req.usuario.institucion_id]); res.json({ ok: true }); }
+    catch { res.status(400).json({ error: 'Usuario ya existe' }); }
+});
+app.delete('/profesor/estudiantes/:id', auth, async (req, res) => { await query("DELETE FROM usuarios WHERE id = $1 AND rol = 'estudiante' AND institucion_id = $2", [req.params.id, req.usuario.institucion_id]); res.json({ ok: true }); });
+app.get('/profesor/clase', auth, async (req, res) => { const { rows } = await query("SELECT id, nombre, usuario FROM usuarios WHERE rol = 'estudiante' AND institucion_id = $1 ORDER BY nombre", [req.usuario.institucion_id]); res.json(rows); });
+app.get('/profesor/progreso', auth, async (req, res) => { const { rows } = await query("SELECT u.nombre as estudiante, p.juego, MAX(p.puntaje) as puntaje FROM progreso p JOIN usuarios u ON p.usuario_id = u.id WHERE u.institucion_id = $1 AND u.rol = 'estudiante' GROUP BY u.id, u.nombre, p.juego ORDER BY u.nombre, p.juego", [req.usuario.institucion_id]); res.json(rows); });
 
-app.get('/coordinador/stats', auth, (req, res) => { const id = req.usuario.institucion_id; res.json({ totalProfes: db.prepare("SELECT COUNT(*) as total FROM usuarios WHERE rol = 'profe' AND institucion_id = ?").get(id), totalEstudiantes: db.prepare("SELECT COUNT(*) as total FROM usuarios WHERE rol = 'estudiante' AND institucion_id = ?").get(id), jugadas: db.prepare("SELECT p.juego, COUNT(*) as veces FROM progreso p JOIN usuarios u ON p.usuario_id = u.id WHERE u.institucion_id = ? GROUP BY p.juego ORDER BY veces DESC").all(id) }); });
-app.get('/coordinador/profes', auth, (req, res) => res.json(db.prepare("SELECT id, nombre, usuario FROM usuarios WHERE rol = 'profe' AND institucion_id = ?").all(req.usuario.institucion_id)));
-app.post('/coordinador/profes', auth, (req, res) => { try { db.prepare("INSERT INTO usuarios (nombre, usuario, password, rol, institucion_id) VALUES (?, ?, ?, 'profe', ?)").run(req.body.nombre, req.body.usuario, bcrypt.hashSync(req.body.password, 10), req.usuario.institucion_id); res.json({ ok: true }); } catch { res.status(400).json({ error: 'Usuario ya existe' }); } });
-app.delete('/coordinador/profes/:id', auth, (req, res) => { db.prepare("DELETE FROM usuarios WHERE id = ? AND rol = 'profe' AND institucion_id = ?").run(req.params.id, req.usuario.institucion_id); res.json({ ok: true }); });
-
-app.get('/profesor/estudiantes', auth, (req, res) => res.json(db.prepare("SELECT id, nombre, usuario FROM usuarios WHERE rol = 'estudiante' AND institucion_id = ?").all(req.usuario.institucion_id)));
-app.post('/profesor/estudiantes', auth, (req, res) => { try { db.prepare("INSERT INTO usuarios (nombre, usuario, password, rol, institucion_id) VALUES (?, ?, ?, 'estudiante', ?)").run(req.body.nombre, req.body.usuario, bcrypt.hashSync(req.body.password, 10), req.usuario.institucion_id); res.json({ ok: true }); } catch { res.status(400).json({ error: 'Usuario ya existe' }); } });
-app.delete('/profesor/estudiantes/:id', auth, (req, res) => { db.prepare("DELETE FROM usuarios WHERE id = ? AND rol = 'estudiante' AND institucion_id = ?").run(req.params.id, req.usuario.institucion_id); res.json({ ok: true }); });
-app.get('/profesor/clase', auth, (req, res) => res.json(db.prepare("SELECT id, nombre, usuario FROM usuarios WHERE rol = 'estudiante' AND institucion_id = ? ORDER BY nombre").all(req.usuario.institucion_id)));
-app.get('/profesor/progreso', auth, (req, res) => res.json(db.prepare("SELECT u.nombre as estudiante, p.juego, MAX(p.puntaje) as puntaje FROM progreso p JOIN usuarios u ON p.usuario_id = u.id WHERE u.institucion_id = ? AND u.rol = 'estudiante' GROUP BY u.id, p.juego ORDER BY u.nombre, p.juego").all(req.usuario.institucion_id)));
-
-app.listen(PORT, () => console.log('Servidor en puerto ' + PORT));
+// ── Iniciar servidor ───────────────────────────────────────────────────────
+initDB().then(() => {
+    app.listen(PORT, () => console.log('Servidor en puerto ' + PORT));
+}).catch(err => {
+    console.error('Error iniciando DB:', err);
+    process.exit(1);
+});
